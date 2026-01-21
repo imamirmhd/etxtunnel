@@ -168,9 +168,27 @@ type UDPConnWrapper struct {
 	conn       *net.UDPConn
 	tunnelConn *UDPTunnelConn
 	protocol   *TCPOverUDP
+	buffer     []byte // Buffer for initial packet data
+	bufferPos  int    // Current position in buffer
+	mu         sync.Mutex
 }
 
 func (u *UDPConnWrapper) Read(b []byte) (int, error) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	// First, return any buffered data
+	if u.bufferPos < len(u.buffer) {
+		n := copy(b, u.buffer[u.bufferPos:])
+		u.bufferPos += n
+		if u.bufferPos >= len(u.buffer) {
+			u.buffer = nil // Clear buffer after reading
+			u.bufferPos = 0
+		}
+		return n, nil
+	}
+
+	// Then read from the connection
 	data, err := u.protocol.ReceiveData(u)
 	if err != nil {
 		return 0, err
@@ -222,9 +240,19 @@ type UDPListener struct {
 
 func (l *UDPListener) Accept() (net.Conn, error) {
 	buffer := make([]byte, 65507)
-	_, addr, err := l.conn.ReadFromUDP(buffer)
+	n, addr, err := l.conn.ReadFromUDP(buffer)
 	if err != nil {
 		return nil, err
+	}
+
+	// Parse packet header (seq + ack = 8 bytes) and extract data
+	var packetData []byte
+	if n >= 8 {
+		// Skip header (seq + ack), extract payload
+		packetData = buffer[8:n]
+	} else {
+		// No header, use entire packet
+		packetData = buffer[:n]
 	}
 
 	// Create tunnel connection
@@ -239,7 +267,7 @@ func (l *UDPListener) Accept() (net.Conn, error) {
 	l.protocol.connections[tunnelConn.id] = tunnelConn
 	l.protocol.mu.Unlock()
 
-	// Create connection wrapper
+	// Create connection wrapper with the received data buffered
 	conn, err := net.DialUDP("udp", nil, addr)
 	if err != nil {
 		return nil, err
@@ -249,6 +277,8 @@ func (l *UDPListener) Accept() (net.Conn, error) {
 		conn:       conn,
 		tunnelConn: tunnelConn,
 		protocol:   l.protocol,
+		buffer:     packetData, // Store initial packet data
+		bufferPos:  0,
 	}, nil
 }
 
