@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,6 +22,7 @@ type Server struct {
 	protocol    protocols.Protocol
 	listener    net.Listener
 	connections map[string]*ServerConnection
+	clients     map[string]*config.ClientInfo // Map by auth token for quick lookup
 	mu          sync.RWMutex
 	ctx         context.Context
 	cancel      context.CancelFunc
@@ -35,6 +37,7 @@ type ServerConnection struct {
 	BytesReceived   int64
 	CreatedAt       time.Time
 	ClientIP        string
+	ClientInfo      *config.ClientInfo
 	mu              sync.Mutex
 }
 
@@ -42,19 +45,38 @@ type ServerConnection struct {
 func NewServer(cfg *config.ServerProtocolConfig, log *logger.TunnelLogger) (*Server, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
+	// Build client lookup map by auth token
+	clients := make(map[string]*config.ClientInfo)
+	for i := range cfg.Clients {
+		client := &cfg.Clients[i]
+		clients[client.AuthToken] = client
+		log.Info("Registered client: %s (real: %s, fake: %s)", 
+			client.AuthToken[:min(8, len(client.AuthToken))]+"...", 
+			client.RealIP, client.FakeIP)
+	}
+
+	// Use first client's fake IP for protocol initialization (for backward compatibility)
+	// In practice, protocols may need to handle multiple source IPs differently
+	var fakeIP string
+	if len(cfg.Clients) > 0 {
+		fakeIP = cfg.Clients[0].FakeIP
+	} else {
+		fakeIP = cfg.ClientFakeIP // Fallback for backward compatibility
+	}
+
 	// Create protocol based on configuration
 	var protocol protocols.Protocol
 	switch cfg.Protocol {
 	case config.TCPOverUDP:
-		protocol = protocols.NewTCPOverUDP(cfg.ClientFakeIP, cfg.Port)
+		protocol = protocols.NewTCPOverUDP(fakeIP, cfg.Port)
 	case config.TCPOverICMP:
-		protocol = protocols.NewTCPOverICMP(cfg.ClientFakeIP)
+		protocol = protocols.NewTCPOverICMP(fakeIP)
 	case config.TCPOverIP:
-		protocol = protocols.NewTCPOverIP(cfg.ClientFakeIP)
+		protocol = protocols.NewTCPOverIP(fakeIP)
 	case config.TCPOverTCP:
-		protocol = protocols.NewTCPOverTCP(cfg.ClientFakeIP)
+		protocol = protocols.NewTCPOverTCP(fakeIP)
 	case config.TCPOverDNS:
-		protocol = protocols.NewTCPOverDNS(cfg.DNSServer, cfg.DNSDomain, cfg.ClientFakeIP)
+		protocol = protocols.NewTCPOverDNS(cfg.DNSServer, cfg.DNSDomain, fakeIP)
 	default:
 		return nil, fmt.Errorf("unsupported protocol: %s", cfg.Protocol)
 	}
@@ -64,11 +86,21 @@ func NewServer(cfg *config.ServerProtocolConfig, log *logger.TunnelLogger) (*Ser
 		logger:      log,
 		protocol:    protocol,
 		connections: make(map[string]*ServerConnection),
+		clients:     clients,
 		ctx:         ctx,
 		cancel:      cancel,
 	}
 
+	log.Info("Server initialized with %d client(s)", len(clients))
 	return server, nil
+}
+
+// min returns the minimum of two integers
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // Start starts the server
@@ -120,13 +152,6 @@ func (s *Server) handleConnection(clientConn net.Conn) {
 	clientIP := s.getClientIP(clientConn)
 	s.logger.Info("New connection: %s from %s", connID, clientIP)
 
-	// Verify client IP matches expected
-	if clientIP != s.config.ClientRealIP && clientIP != s.config.ClientFakeIP {
-		s.logger.Warning("Connection from unexpected IP: %s (expected: %s or %s)", 
-			clientIP, s.config.ClientRealIP, s.config.ClientFakeIP)
-		// Continue anyway for flexibility
-	}
-
 	// Read authentication token
 	authBuffer := make([]byte, 256)
 	n, err := clientConn.Read(authBuffer)
@@ -137,20 +162,50 @@ func (s *Server) handleConnection(clientConn net.Conn) {
 	}
 
 	receivedToken := string(authBuffer[:n])
-	if !utils.VerifyAuthToken(s.config.AuthToken, receivedToken) {
-		s.logger.Error("Invalid authentication token from %s", clientIP)
+	receivedToken = trimToken(receivedToken) // Remove any trailing whitespace/newlines
+
+	// Look up client by auth token
+	s.mu.RLock()
+	clientInfo, found := s.clients[receivedToken]
+	s.mu.RUnlock()
+
+	if !found {
+		s.logger.Error("Invalid authentication token from %s (token: %s...)", 
+			clientIP, receivedToken[:min(8, len(receivedToken))])
 		clientConn.Close()
 		return
 	}
 
+	// Verify client IP matches expected (real or fake IP)
+	if clientIP != clientInfo.RealIP && clientIP != clientInfo.FakeIP {
+		s.logger.Warning("Connection from unexpected IP: %s (expected: %s or %s for client)", 
+			clientIP, clientInfo.RealIP, clientInfo.FakeIP)
+		// Continue anyway for flexibility, but log the warning
+	}
+
+	s.logger.Info("Authenticated client: %s (real: %s, fake: %s)", 
+		clientInfo.RealIP, clientInfo.RealIP, clientInfo.FakeIP)
+
+	// Determine forward destination (per-client override or default)
+	forwardIP := clientInfo.ForwardDestinationIP
+	forwardPort := clientInfo.ForwardDestinationPort
+	if forwardIP == "" {
+		forwardIP = s.config.ForwardDestinationIP
+	}
+	if forwardPort == 0 {
+		forwardPort = s.config.ForwardDestinationPort
+	}
+
 	// Connect to forward destination
-	forwardAddr := fmt.Sprintf("%s:%d", s.config.ForwardDestinationIP, s.config.ForwardDestinationPort)
+	forwardAddr := fmt.Sprintf("%s:%d", forwardIP, forwardPort)
 	forwardConn, err := net.DialTimeout("tcp", forwardAddr, 30*time.Second)
 	if err != nil {
-		s.logger.Error("Failed to connect to forward destination: %v", err)
+		s.logger.Error("Failed to connect to forward destination %s: %v", forwardAddr, err)
 		clientConn.Close()
 		return
 	}
+
+	s.logger.Debug("Forwarding to: %s", forwardAddr)
 
 	// Create connection tracking
 	serverConn := &ServerConnection{
@@ -159,6 +214,7 @@ func (s *Server) handleConnection(clientConn net.Conn) {
 		ForwardConn: forwardConn,
 		CreatedAt:   time.Now(),
 		ClientIP:    clientIP,
+		ClientInfo:  clientInfo,
 	}
 
 	s.mu.Lock()
@@ -178,6 +234,14 @@ func (s *Server) handleConnection(clientConn net.Conn) {
 	s.logger.RemoveConnection(connID)
 	clientConn.Close()
 	forwardConn.Close()
+}
+
+// trimToken removes whitespace and newlines from token
+func trimToken(token string) string {
+	// Remove common whitespace characters
+	token = strings.TrimSpace(token)
+	token = strings.Trim(token, "\n\r\t")
+	return token
 }
 
 // forwardConnection forwards data between client and forward destination

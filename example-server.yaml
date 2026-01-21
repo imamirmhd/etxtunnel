@@ -3,18 +3,42 @@
 # Protocol type: tcp_over_udp, tcp_over_icmp, tcp_over_ip, tcp_over_tcp, tcp_over_dns
 protocol: "tcp_over_udp"
 
-# Client configuration
-client_real_ip: "192.168.1.50"      # Real IP of the client
-client_fake_ip: "192.168.1.51"      # Fake IP the client uses for spoofing
-auth_token: "your-secret-token-here"
-
 # Server listening port (ICMP operates at Layer 3, so no port needed for ICMP)
 port: 9999
 
-# Forward destination (where to forward client traffic)
+# Default forward destination (used if client doesn't specify its own)
 forward_destination_ip: "127.0.0.1"
 forward_destination_port: 80
+
+# Multiple clients configuration
+clients:
+  # Client 1
+  - real_ip: "192.168.1.50"      # Real IP of the client
+    fake_ip: "192.168.1.51"       # Fake IP the client uses for spoofing
+    auth_token: "client1-secret-token"
+    # Optional: per-client forward destination (overrides default)
+    # forward_destination_ip: "127.0.0.1"
+    # forward_destination_port: 8080
+
+  # Client 2
+  - real_ip: "192.168.1.52"
+    fake_ip: "192.168.1.53"
+    auth_token: "client2-secret-token"
+    forward_destination_ip: "127.0.0.1"
+    forward_destination_port: 8080
+
+  # Client 3
+  - real_ip: "10.0.0.100"
+    fake_ip: "10.0.0.101"
+    auth_token: "client3-secret-token"
+    # Uses default forward destination
 
 # DNS-specific settings (only for tcp_over_dns protocol)
 dns_server: "8.8.8.8"
 dns_domain: "example.com"
+
+# Legacy single-client format (backward compatibility - deprecated)
+# If 'clients' array is not provided, these will be used:
+# client_real_ip: "192.168.1.50"
+# client_fake_ip: "192.168.1.51"
+# auth_token: "your-secret-token-here"

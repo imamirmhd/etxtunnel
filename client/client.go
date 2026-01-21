@@ -45,6 +45,16 @@ type ClientConnection struct {
 func NewClient(cfg *config.ClientConfig, log *logger.TunnelLogger) *Client {
 	ctx, cancel := context.WithCancel(context.Background())
 
+	// Validate configuration
+	if len(cfg.Servers) == 0 {
+		log.Warning("No servers configured in client config")
+	} else {
+		log.Info("Loaded %d server(s) from configuration", len(cfg.Servers))
+		for i, srv := range cfg.Servers {
+			log.Debug("Server %d: %s:%d (source: %s)", i+1, srv.RealIP, srv.Port, srv.SourceAddress)
+		}
+	}
+
 	lb := loadbalancer.NewLoadBalancer(cfg.Servers, cfg.LoadBalanceAlgorithm)
 
 	client := &Client{
@@ -125,10 +135,13 @@ func (c *Client) handleConnection(localConn net.Conn) {
 	// Select server using load balancer
 	server := c.loadBalancer.GetServer(connID)
 	if server == nil {
-		c.logger.Error("No servers available")
+		c.logger.Error("No servers available - check your configuration file")
+		c.logger.Error("Expected at least one server in 'servers' section of config")
 		localConn.Close()
 		return
 	}
+	
+	c.logger.Debug("Selected server: %s:%d", server.RealIP, server.Port)
 
 	// Create protocol based on server configuration
 	// For now, we'll use TCP over UDP as default

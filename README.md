@@ -107,6 +107,8 @@ servers:
 
 Create a `server.yaml` file (see `example-server.yaml` for reference):
 
+#### Single Client (Legacy Format - Still Supported)
+
 ```yaml
 protocol: "tcp_over_udp"
 client_real_ip: "192.168.1.50"
@@ -115,20 +117,55 @@ auth_token: "your-secret-token"
 port: 9999
 forward_destination_ip: "127.0.0.1"
 forward_destination_port: 80
-dns_server: "8.8.8.8"  # Only for DNS protocol
-dns_domain: "example.com"  # Only for DNS protocol
+```
+
+#### Multiple Clients (Recommended)
+
+```yaml
+protocol: "tcp_over_udp"
+port: 9999
+forward_destination_ip: "127.0.0.1"      # Default for all clients
+forward_destination_port: 80              # Default for all clients
+
+clients:
+  - real_ip: "192.168.1.50"
+    fake_ip: "192.168.1.51"
+    auth_token: "client1-token"
+    # Optional: per-client forward destination
+    # forward_destination_ip: "127.0.0.1"
+    # forward_destination_port: 8080
+
+  - real_ip: "192.168.1.52"
+    fake_ip: "192.168.1.53"
+    auth_token: "client2-token"
+    forward_destination_ip: "127.0.0.1"
+    forward_destination_port: 8080
 ```
 
 **Configuration Options**:
 - `protocol`: One of `tcp_over_udp`, `tcp_over_icmp`, `tcp_over_ip`, `tcp_over_tcp`, `tcp_over_dns`
-- `client_real_ip`: Expected real IP of the client
-- `client_fake_ip`: Expected fake IP used by client for spoofing
-- `auth_token`: Authentication token (must match client)
 - `port`: Port to listen on (not applicable for ICMP)
-- `forward_destination_ip`: IP to forward traffic to
-- `forward_destination_port`: Port to forward traffic to
+- `forward_destination_ip`: Default IP to forward traffic to (can be overridden per-client)
+- `forward_destination_port`: Default port to forward traffic to (can be overridden per-client)
+- `clients`: Array of client configurations (recommended)
+  - `real_ip`: Expected real IP of the client
+  - `fake_ip`: Expected fake IP used by client for spoofing
+  - `auth_token`: Authentication token (must match client)
+  - `forward_destination_ip`: Optional per-client forward IP (overrides default)
+  - `forward_destination_port`: Optional per-client forward port (overrides default)
+- Legacy single-client format (deprecated but still supported):
+  - `client_real_ip`: Expected real IP of the client
+  - `client_fake_ip`: Expected fake IP used by client for spoofing
+  - `auth_token`: Authentication token
 - `dns_server`: DNS server for DNS tunneling (optional)
 - `dns_domain`: Domain for DNS tunneling (optional)
+
+**Multiple Clients Support**:
+- The server can handle multiple clients simultaneously
+- Each client is identified by its unique `auth_token`
+- Each client can have its own forward destination
+- Clients are authenticated by matching their auth token
+- IP verification (real/fake) is performed per client
 
 ## Usage
 

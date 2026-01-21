@@ -46,17 +46,31 @@ type ClientConfig struct {
 	BlockedRanges       []string         `yaml:"blocked_ranges"` // CIDR ranges
 }
 
+// ClientInfo represents a client configuration on the server side
+type ClientInfo struct {
+	RealIP              string `yaml:"real_ip"`
+	FakeIP              string `yaml:"fake_ip"`
+	AuthToken           string `yaml:"auth_token"`
+	ForwardDestinationIP string `yaml:"forward_destination_ip,omitempty"`    // Per-client override
+	ForwardDestinationPort int  `yaml:"forward_destination_port,omitempty"`   // Per-client override
+}
+
 // ServerProtocolConfig represents server-side protocol configuration
 type ServerProtocolConfig struct {
 	Protocol              ProtocolType `yaml:"protocol"`
-	ClientRealIP          string       `yaml:"client_real_ip"`
-	ClientFakeIP          string       `yaml:"client_fake_ip"`
-	AuthToken             string       `yaml:"auth_token"`
 	Port                  int          `yaml:"port"`
-	ForwardDestinationIP  string       `yaml:"forward_destination_ip"`
-	ForwardDestinationPort int         `yaml:"forward_destination_port"`
-	DNSServer            string        `yaml:"dns_server,omitempty"`   // For DNS tunneling
-	DNSDomain            string        `yaml:"dns_domain,omitempty"`    // For DNS tunneling
+	ForwardDestinationIP  string       `yaml:"forward_destination_ip"`        // Default for all clients
+	ForwardDestinationPort int         `yaml:"forward_destination_port"`     // Default for all clients
+	DNSServer            string        `yaml:"dns_server,omitempty"`          // For DNS tunneling
+	DNSDomain            string        `yaml:"dns_domain,omitempty"`         // For DNS tunneling
+	
+	// Support both single client (backward compatibility) and multiple clients
+	ClientRealIP          string       `yaml:"client_real_ip,omitempty"`     // Deprecated: use clients[]
+	ClientFakeIP          string       `yaml:"client_fake_ip,omitempty"`     // Deprecated: use clients[]
+	AuthToken             string       `yaml:"auth_token,omitempty"`        // Deprecated: use clients[]
+	
+	// Multiple clients support
+	Clients               []ClientInfo `yaml:"clients,omitempty"`
 }
 
 // LoadClientConfig loads client configuration from YAML file
@@ -87,6 +101,34 @@ func LoadClientConfig(path string) (*ClientConfig, error) {
 	}
 	if config.LoadBalanceAlgorithm == "" {
 		config.LoadBalanceAlgorithm = RoundRobin
+	}
+
+	// Validate servers
+	if len(config.Servers) == 0 {
+		return nil, fmt.Errorf("no servers configured - at least one server is required in 'servers' section")
+	}
+
+	// Validate each server
+	for i, srv := range config.Servers {
+		if srv.RealIP == "" {
+			return nil, fmt.Errorf("server %d: 'real_ip' is required", i+1)
+		}
+		if srv.Port <= 0 || srv.Port > 65535 {
+			return nil, fmt.Errorf("server %d: invalid port %d (must be 1-65535)", i+1, srv.Port)
+		}
+		if srv.AuthToken == "" {
+			return nil, fmt.Errorf("server %d: 'auth_token' is required", i+1)
+		}
+		if srv.SourceAddress == "" {
+			return nil, fmt.Errorf("server %d: 'source_address' is required", i+1)
+		}
+		if srv.KeepaliveInterval <= 0 {
+			srv.KeepaliveInterval = 30 // Default
+		}
+		if srv.Weight <= 0 {
+			srv.Weight = 1 // Default
+		}
+		config.Servers[i] = srv
 	}
 
 	return &config, nil
@@ -124,6 +166,54 @@ func LoadServerConfig(path string) (*ServerProtocolConfig, error) {
 		// Valid
 	default:
 		return nil, fmt.Errorf("invalid protocol: %s", config.Protocol)
+	}
+
+	// Backward compatibility: convert single client config to clients array
+	if len(config.Clients) == 0 {
+		if config.ClientRealIP != "" || config.ClientFakeIP != "" || config.AuthToken != "" {
+			// Migrate old single-client format to new format
+			config.Clients = []ClientInfo{
+				{
+					RealIP:    config.ClientRealIP,
+					FakeIP:    config.ClientFakeIP,
+					AuthToken: config.AuthToken,
+				},
+			}
+		}
+	}
+
+	// Validate clients
+	if len(config.Clients) == 0 {
+		return nil, fmt.Errorf("no clients configured - at least one client is required in 'clients' section (or use legacy 'client_real_ip', 'client_fake_ip', 'auth_token')")
+	}
+
+	// Validate each client
+	for i, client := range config.Clients {
+		if client.RealIP == "" {
+			return nil, fmt.Errorf("client %d: 'real_ip' is required", i+1)
+		}
+		if client.FakeIP == "" {
+			return nil, fmt.Errorf("client %d: 'fake_ip' is required", i+1)
+		}
+		if client.AuthToken == "" {
+			return nil, fmt.Errorf("client %d: 'auth_token' is required", i+1)
+		}
+		// Use default forward destination if not specified per-client
+		if client.ForwardDestinationIP == "" {
+			client.ForwardDestinationIP = config.ForwardDestinationIP
+		}
+		if client.ForwardDestinationPort == 0 {
+			client.ForwardDestinationPort = config.ForwardDestinationPort
+		}
+		config.Clients[i] = client
+	}
+
+	// Validate default forward destination
+	if config.ForwardDestinationIP == "" {
+		return nil, fmt.Errorf("'forward_destination_ip' is required")
+	}
+	if config.ForwardDestinationPort <= 0 || config.ForwardDestinationPort > 65535 {
+		return nil, fmt.Errorf("invalid 'forward_destination_port': %d (must be 1-65535)", config.ForwardDestinationPort)
 	}
 
 	return &config, nil

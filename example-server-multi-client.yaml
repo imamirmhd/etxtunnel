@@ -1,0 +1,48 @@
+# ETXTunnel Server Configuration - Multiple Clients Example
+
+# Protocol type: tcp_over_udp, tcp_over_icmp, tcp_over_ip, tcp_over_tcp, tcp_over_dns
+protocol: "tcp_over_udp"
+
+# Server listening port
+port: 9999
+
+# Default forward destination (used if client doesn't specify its own)
+forward_destination_ip: "127.0.0.1"
+forward_destination_port: 80
+
+# Multiple clients configuration
+# Each client can have its own:
+# - Real and fake IP addresses
+# - Authentication token
+# - Optional: Custom forward destination (overrides default)
+clients:
+  # Client 1 - Web server forwarding
+  - real_ip: "37.32.41.182"
+    fake_ip: "2.188.21.46"
+    auth_token: "client1-web-token"
+    forward_destination_ip: "127.0.0.1"
+    forward_destination_port: 80
+
+  # Client 2 - SSH forwarding
+  - real_ip: "192.168.1.100"
+    fake_ip: "192.168.1.101"
+    auth_token: "client2-ssh-token"
+    forward_destination_ip: "127.0.0.1"
+    forward_destination_port: 22
+
+  # Client 3 - Database forwarding (uses default)
+  - real_ip: "10.0.0.50"
+    fake_ip: "10.0.0.51"
+    auth_token: "client3-db-token"
+    # No forward_destination specified - uses default above
+
+  # Client 4 - Custom service
+  - real_ip: "172.16.0.10"
+    fake_ip: "172.16.0.11"
+    auth_token: "client4-custom-token"
+    forward_destination_ip: "127.0.0.1"
+    forward_destination_port: 3000
+
+# DNS-specific settings (only for tcp_over_dns protocol)
+# dns_server: "8.8.8.8"
+# dns_domain: "example.com"

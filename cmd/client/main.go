@@ -32,6 +32,11 @@ func init() {
 }
 
 func runClient(cmd *cobra.Command, args []string) error {
+	// Allow config file as positional argument if not provided via flag
+	if configPath == "client.yaml" && len(args) > 0 {
+		configPath = args[0]
+	}
+	
 	// Load configuration
 	cfg, err := config.LoadClientConfig(configPath)
 	if err != nil {
