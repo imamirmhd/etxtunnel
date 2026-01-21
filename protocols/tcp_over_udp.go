@@ -16,7 +16,8 @@ type TCPOverUDP struct {
 	conn         *net.UDPConn
 	spoofedIP    string
 	spoofedPort  int
-	connections  map[string]*UDPTunnelConn
+	connections  map[string]*UDPTunnelConn // By connection ID
+	addrConnMap  map[string]*UDPConnWrapper // By client address for connection reuse
 	mu           sync.RWMutex
 	readTimeout  time.Duration
 	writeTimeout time.Duration
@@ -39,6 +40,7 @@ func NewTCPOverUDP(spoofedIP string, spoofedPort int) *TCPOverUDP {
 		spoofedIP:    spoofedIP,
 		spoofedPort:  spoofedPort,
 		connections:  make(map[string]*UDPTunnelConn),
+		addrConnMap:  make(map[string]*UDPConnWrapper),
 		readTimeout:  30 * time.Second,
 		writeTimeout: 30 * time.Second,
 	}
@@ -52,9 +54,26 @@ func (t *TCPOverUDP) Connect(ctx context.Context, serverAddr string, authToken s
 	}
 
 	// Create UDP connection
-	conn, err := net.DialUDP("udp", nil, addr)
+	var localAddr *net.UDPAddr
+	if t.spoofedIP != "" {
+		// If spoofing, bind to a specific local address
+		localIP := net.ParseIP(t.spoofedIP)
+		if localIP != nil {
+			localAddr = &net.UDPAddr{IP: localIP, Port: 0} // Let system choose port
+		}
+	}
+	conn, err := net.DialUDP("udp", localAddr, addr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to dial UDP: %w", err)
+	}
+
+	// Get the actual local port assigned
+	localUDPAddr := conn.LocalAddr().(*net.UDPAddr)
+	actualPort := localUDPAddr.Port
+	
+	// Update spoofedPort if it was 0
+	if t.spoofedPort == 0 {
+		t.spoofedPort = actualPort
 	}
 
 	// Send authentication
@@ -124,13 +143,30 @@ func (t *TCPOverUDP) ReceiveData(conn net.Conn) ([]byte, error) {
 	}
 
 	buffer := make([]byte, 65507) // Max UDP packet size
-	n, err := udpConn.conn.Read(buffer)
+	n, addr, err := udpConn.conn.ReadFromUDP(buffer)
 	if err != nil {
 		return nil, err
 	}
 
-	// Parse packet (simplified - would need proper protocol parsing)
-	return buffer[:n], nil
+	// Verify this packet is from the expected remote address
+	if udpConn.tunnelConn.remoteAddr != nil {
+		if addr.IP.String() != udpConn.tunnelConn.remoteAddr.IP.String() {
+			// Packet from different source, ignore or handle accordingly
+			return t.ReceiveData(conn) // Try again
+		}
+	}
+
+	// Parse packet header (seq + ack = 8 bytes) and extract payload
+	var packetData []byte
+	if n >= 8 {
+		// Skip header (seq + ack), extract payload
+		packetData = buffer[8:n]
+	} else {
+		// No header, use entire packet
+		packetData = buffer[:n]
+	}
+
+	return packetData, nil
 }
 
 // sendPacket sends a packet with sequence and acknowledgment numbers
@@ -145,12 +181,21 @@ func (t *TCPOverUDP) sendPacket(conn *net.UDPConn, addr *net.UDPAddr, seq, ack u
 	if t.spoofedIP != "" {
 		spoofedAddr := net.ParseIP(t.spoofedIP)
 		if spoofedAddr != nil {
-			// Use spoofing for sending
+			// Get actual source port from connection
+			srcPort := t.spoofedPort
+			if srcPort == 0 {
+				localAddr := conn.LocalAddr()
+				if udpAddr, ok := localAddr.(*net.UDPAddr); ok {
+					srcPort = udpAddr.Port
+				}
+			}
+			// Use spoofing for sending (requires root)
 			return spoofing.SpoofUDP(t.spoofedIP, addr.IP.String(), 
-				t.spoofedPort, addr.Port, packet)
+				srcPort, addr.Port, packet)
 		}
 	}
 
+	// Normal UDP send (no spoofing)
 	_, err := conn.WriteToUDP(packet, addr)
 	return err
 }
@@ -207,6 +252,10 @@ func (u *UDPConnWrapper) Write(b []byte) (int, error) {
 func (u *UDPConnWrapper) Close() error {
 	u.protocol.mu.Lock()
 	delete(u.protocol.connections, u.tunnelConn.id)
+	// Remove from address map
+	if u.tunnelConn.remoteAddr != nil {
+		delete(u.protocol.addrConnMap, u.tunnelConn.remoteAddr.String())
+	}
 	u.protocol.mu.Unlock()
 	return u.conn.Close()
 }
@@ -245,6 +294,31 @@ func (l *UDPListener) Accept() (net.Conn, error) {
 		return nil, err
 	}
 
+	addrKey := addr.String()
+
+	// Check if we already have a connection for this address
+	l.protocol.mu.RLock()
+	existingConn, exists := l.protocol.addrConnMap[addrKey]
+	l.protocol.mu.RUnlock()
+
+	if exists {
+		// Existing connection - append data to its buffer
+		existingConn.mu.Lock()
+		// Parse packet header if present
+		var packetData []byte
+		if n >= 8 {
+			packetData = buffer[8:n]
+		} else {
+			packetData = buffer[:n]
+		}
+		// Append to existing buffer
+		existingConn.buffer = append(existingConn.buffer, packetData...)
+		existingConn.mu.Unlock()
+		// Return nil to indicate this is not a new connection
+		// The server will handle this differently
+		return nil, fmt.Errorf("existing connection")
+	}
+
 	// Parse packet header (seq + ack = 8 bytes) and extract data
 	var packetData []byte
 	if n >= 8 {
@@ -263,23 +337,27 @@ func (l *UDPListener) Accept() (net.Conn, error) {
 		lastActivity: time.Now(),
 	}
 
-	l.protocol.mu.Lock()
-	l.protocol.connections[tunnelConn.id] = tunnelConn
-	l.protocol.mu.Unlock()
-
 	// Create connection wrapper with the received data buffered
 	conn, err := net.DialUDP("udp", nil, addr)
 	if err != nil {
 		return nil, err
 	}
 
-	return &UDPConnWrapper{
+	wrapper := &UDPConnWrapper{
 		conn:       conn,
 		tunnelConn: tunnelConn,
 		protocol:   l.protocol,
 		buffer:     packetData, // Store initial packet data
 		bufferPos:  0,
-	}, nil
+	}
+
+	// Store in connection maps
+	l.protocol.mu.Lock()
+	l.protocol.connections[tunnelConn.id] = tunnelConn
+	l.protocol.addrConnMap[addrKey] = wrapper
+	l.protocol.mu.Unlock()
+
+	return wrapper, nil
 }
 
 func (l *UDPListener) Close() error {

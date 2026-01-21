@@ -134,6 +134,10 @@ func (s *Server) acceptLoop() {
 		default:
 			conn, err := s.listener.Accept()
 			if err != nil {
+				// For UDP, "existing connection" errors are expected for subsequent packets
+				if err.Error() == "existing connection" {
+					continue
+				}
 				s.logger.Error("Failed to accept connection: %v", err)
 				continue
 			}
@@ -153,6 +157,10 @@ func (s *Server) handleConnection(clientConn net.Conn) {
 	s.logger.Info("New connection: %s from %s", connID, clientIP)
 
 	// Read authentication token
+	// For UDP, we need to read only the first packet's data (auth token)
+	// Set a read deadline to avoid blocking
+	clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	
 	authBuffer := make([]byte, 256)
 	n, err := clientConn.Read(authBuffer)
 	if err != nil {
@@ -160,9 +168,34 @@ func (s *Server) handleConnection(clientConn net.Conn) {
 		clientConn.Close()
 		return
 	}
+	
+	// Clear read deadline
+	clientConn.SetReadDeadline(time.Time{})
 
+	// For UDP, the buffer might contain the auth token plus subsequent data
+	// We need to extract only the auth token part
+	// The auth token should be the first part before any HTTP-like data
 	receivedToken := string(authBuffer[:n])
+	
+	// Try to find the end of the token (it should end before any HTTP methods or other data)
+	// Look for common HTTP method patterns
+	httpMethods := []string{"GET ", "POST", "PUT ", "HEAD", "OPTIO"}
+	tokenEnd := len(receivedToken)
+	for _, method := range httpMethods {
+		if idx := strings.Index(receivedToken, method); idx != -1 && idx < tokenEnd {
+			tokenEnd = idx
+		}
+	}
+	
+	// Also look for newline which might separate token from data
+	if idx := strings.Index(receivedToken, "\n"); idx != -1 && idx < tokenEnd {
+		tokenEnd = idx
+	}
+	
+	receivedToken = receivedToken[:tokenEnd]
 	receivedToken = trimToken(receivedToken) // Remove any trailing whitespace/newlines
+	
+	s.logger.Debug("Received auth token (length: %d): %q", len(receivedToken), receivedToken)
 
 	// Look up client by auth token
 	s.mu.RLock()
@@ -170,8 +203,18 @@ func (s *Server) handleConnection(clientConn net.Conn) {
 	s.mu.RUnlock()
 
 	if !found {
-		s.logger.Error("Invalid authentication token from %s (token: %s...)", 
-			clientIP, receivedToken[:min(8, len(receivedToken))])
+		// Try to find by partial match for debugging
+		s.logger.Error("Invalid authentication token from %s (token length: %d, first 20 chars: %q)", 
+			clientIP, len(receivedToken), receivedToken[:min(20, len(receivedToken))])
+		s.logger.Debug("Available tokens: %v", func() []string {
+			tokens := make([]string, 0, len(s.clients))
+			s.mu.RLock()
+			for token := range s.clients {
+				tokens = append(tokens, token)
+			}
+			s.mu.RUnlock()
+			return tokens
+		}())
 		clientConn.Close()
 		return
 	}
@@ -238,6 +281,8 @@ func (s *Server) handleConnection(clientConn net.Conn) {
 
 // trimToken removes whitespace and newlines from token
 func trimToken(token string) string {
+	// Remove null bytes and other control characters
+	token = strings.TrimRight(token, "\x00")
 	// Remove common whitespace characters
 	token = strings.TrimSpace(token)
 	token = strings.Trim(token, "\n\r\t")
