@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"math/rand"
 	"net"
 	"sync"
 	"time"
@@ -55,26 +56,38 @@ func (t *TCPOverUDP) Connect(ctx context.Context, serverAddr string, authToken s
 
 	// Create UDP connection
 	var localAddr *net.UDPAddr
+	actualPort := t.spoofedPort
+	
 	if t.spoofedIP != "" {
 		// If spoofing, bind to a specific local address
 		localIP := net.ParseIP(t.spoofedIP)
 		if localIP != nil {
-			localAddr = &net.UDPAddr{IP: localIP, Port: 0} // Let system choose port
+			// If port is 0, use a random port from ephemeral range (49152-65535)
+			if actualPort == 0 {
+				// Ephemeral port range: 49152-65535 (IANA recommended)
+				actualPort = 49152 + rand.Intn(65535-49152+1)
+			}
+			localAddr = &net.UDPAddr{IP: localIP, Port: actualPort}
 		}
+	} else if actualPort == 0 {
+		// Even without spoofing, use random port if not specified
+		actualPort = 49152 + rand.Intn(65535-49152+1)
+		localAddr = &net.UDPAddr{IP: nil, Port: actualPort}
 	}
+	
 	conn, err := net.DialUDP("udp", localAddr, addr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to dial UDP: %w", err)
 	}
 
-	// Get the actual local port assigned
+	// Get the actual local port assigned (in case system assigned different port)
 	localUDPAddr := conn.LocalAddr().(*net.UDPAddr)
-	actualPort := localUDPAddr.Port
-	
-	// Update spoofedPort if it was 0
-	if t.spoofedPort == 0 {
-		t.spoofedPort = actualPort
+	if localUDPAddr.Port != 0 {
+		actualPort = localUDPAddr.Port
 	}
+	
+	// Update spoofedPort
+	t.spoofedPort = actualPort
 
 	// Send authentication
 	authData := []byte(authToken)
@@ -181,12 +194,16 @@ func (t *TCPOverUDP) sendPacket(conn *net.UDPConn, addr *net.UDPAddr, seq, ack u
 	if t.spoofedIP != "" {
 		spoofedAddr := net.ParseIP(t.spoofedIP)
 		if spoofedAddr != nil {
-			// Get actual source port from connection
+			// Get actual source port from connection or use configured port
 			srcPort := t.spoofedPort
 			if srcPort == 0 {
 				localAddr := conn.LocalAddr()
 				if udpAddr, ok := localAddr.(*net.UDPAddr); ok {
 					srcPort = udpAddr.Port
+				}
+				// If still 0, use random ephemeral port
+				if srcPort == 0 {
+					srcPort = 49152 + rand.Intn(65535-49152+1)
 				}
 			}
 			// Use spoofing for sending (requires root)
