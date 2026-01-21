@@ -1,0 +1,29 @@
+# ETXTunnel Client Configuration Example
+
+# Local listening address for user connections
+listen_ip: "0.0.0.0"
+listen_port: 8080
+
+# Load balancing algorithm: round_robin, least_connections, random, weighted_round_robin
+load_balance_algorithm: "round_robin"
+
+# Blocked IP ranges (CIDR notation)
+blocked_ranges:
+  - "10.0.0.0/8"
+  - "192.168.0.0/16"
+
+# Server configurations
+servers:
+  - real_ip: "192.168.1.100"
+    port: 9999
+    source_address: "192.168.1.50"  # Fake IP for spoofing
+    auth_token: "your-secret-token-here"
+    keepalive_interval: 30  # seconds
+    weight: 1  # For weighted round robin
+
+  - real_ip: "192.168.1.101"
+    port: 9999
+    source_address: "192.168.1.51"
+    auth_token: "your-secret-token-here"
+    keepalive_interval: 30
+    weight: 2  # Higher weight for this server

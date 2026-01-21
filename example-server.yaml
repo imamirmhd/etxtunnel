@@ -1,0 +1,20 @@
+# ETXTunnel Server Configuration Example
+
+# Protocol type: tcp_over_udp, tcp_over_icmp, tcp_over_ip, tcp_over_tcp, tcp_over_dns
+protocol: "tcp_over_udp"
+
+# Client configuration
+client_real_ip: "192.168.1.50"      # Real IP of the client
+client_fake_ip: "192.168.1.51"      # Fake IP the client uses for spoofing
+auth_token: "your-secret-token-here"
+
+# Server listening port (ICMP operates at Layer 3, so no port needed for ICMP)
+port: 9999
+
+# Forward destination (where to forward client traffic)
+forward_destination_ip: "127.0.0.1"
+forward_destination_port: 80
+
+# DNS-specific settings (only for tcp_over_dns protocol)
+dns_server: "8.8.8.8"
+dns_domain: "example.com"
