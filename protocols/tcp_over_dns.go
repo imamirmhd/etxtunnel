@@ -9,17 +9,19 @@ import (
 	"sync"
 	"time"
 
+	"github.com/etxtunnel/etxtunnel/spoofing"
 	"github.com/miekg/dns"
 )
 
 // TCPOverDNS implements TCP tunneling over DNS
 type TCPOverDNS struct {
-	dnsServer   string
-	dnsDomain   string
-	spoofedIP   string
-	connections map[string]*DNSTunnelConn
-	mu          sync.RWMutex
-	client      *dns.Client
+	dnsServer    string
+	dnsDomain    string
+	spoofedIP    string
+	connections  map[string]*DNSTunnelConn
+	virtualIface string // Name of virtual interface if created
+	mu           sync.RWMutex
+	client       *dns.Client
 }
 
 // DNSTunnelConn represents a DNS-based tunnel connection
@@ -44,6 +46,25 @@ func NewTCPOverDNS(dnsServer, dnsDomain, spoofedIP string) *TCPOverDNS {
 
 // Connect establishes a connection to the server
 func (t *TCPOverDNS) Connect(ctx context.Context, serverAddr string, authToken string) (net.Conn, error) {
+	// If spoofing is enabled, ensure the IP exists on the system
+	if t.spoofedIP != "" {
+		exists, err := spoofing.IPExistsOnSystem(t.spoofedIP)
+		if err != nil {
+			return nil, fmt.Errorf("failed to check if IP exists: %w", err)
+		}
+		
+		if !exists {
+			// Create virtual interface for the spoofed IP
+			ifaceName, err := spoofing.CreateVirtualInterface(t.spoofedIP)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create virtual interface for %s: %w", t.spoofedIP, err)
+			}
+			t.mu.Lock()
+			t.virtualIface = ifaceName
+			t.mu.Unlock()
+		}
+	}
+
 	// DNS tunneling uses DNS queries to send data
 	// The server address is the DNS server IP
 	if t.dnsServer == "" {
@@ -66,6 +87,11 @@ func (t *TCPOverDNS) Connect(ctx context.Context, serverAddr string, authToken s
 	// Send authentication
 	authData := []byte(authToken)
 	if err := t.sendData(tunnelConn, authData); err != nil {
+		// Clean up virtual interface if we created it
+		if t.virtualIface != "" {
+			spoofing.DeleteVirtualInterface(t.virtualIface)
+			t.virtualIface = ""
+		}
 		return nil, fmt.Errorf("failed to send auth: %w", err)
 	}
 
@@ -77,9 +103,38 @@ func (t *TCPOverDNS) Connect(ctx context.Context, serverAddr string, authToken s
 
 // Listen starts listening for incoming DNS connections
 func (t *TCPOverDNS) Listen(ctx context.Context, listenAddr string) (net.Listener, error) {
+	// If spoofing is enabled, ensure the IP exists on the system
+	if t.spoofedIP != "" {
+		exists, err := spoofing.IPExistsOnSystem(t.spoofedIP)
+		if err != nil {
+			return nil, fmt.Errorf("failed to check if IP exists: %w", err)
+		}
+		
+		if !exists {
+			// Create virtual interface for the spoofed IP
+			ifaceName, err := spoofing.CreateVirtualInterface(t.spoofedIP)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create virtual interface for %s: %w", t.spoofedIP, err)
+			}
+			t.mu.Lock()
+			t.virtualIface = ifaceName
+			t.mu.Unlock()
+		}
+	}
+
+	// Parse listen address to potentially override with spoofed IP
+	actualListenAddr := listenAddr
+	if t.spoofedIP != "" {
+		// Extract port from listenAddr
+		_, port, err := net.SplitHostPort(listenAddr)
+		if err == nil && port != "" {
+			actualListenAddr = net.JoinHostPort(t.spoofedIP, port)
+		}
+	}
+
 	// DNS server listener
 	server := &dns.Server{
-		Addr:    listenAddr,
+		Addr:    actualListenAddr,
 		Net:     "udp",
 		Handler: dns.HandlerFunc(t.handleDNSRequest),
 	}
@@ -199,6 +254,16 @@ func (t *TCPOverDNS) handleDNSRequest(w dns.ResponseWriter, r *dns.Msg) {
 
 // Close closes the protocol
 func (t *TCPOverDNS) Close() error {
+	// Clean up virtual interface if we created one
+	t.mu.Lock()
+	ifaceName := t.virtualIface
+	t.virtualIface = ""
+	t.mu.Unlock()
+	
+	if ifaceName != "" {
+		return spoofing.DeleteVirtualInterface(ifaceName)
+	}
+	
 	return nil
 }
 

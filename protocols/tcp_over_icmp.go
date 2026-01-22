@@ -9,14 +9,17 @@ import (
 
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
+
+	"github.com/etxtunnel/etxtunnel/spoofing"
 )
 
 // TCPOverICMP implements TCP tunneling over ICMP
 type TCPOverICMP struct {
-	conn        *icmp.PacketConn
-	spoofedIP   string
-	connections map[string]*ICMPTunnelConn
-	mu          sync.RWMutex
+	conn         *icmp.PacketConn
+	spoofedIP    string
+	connections  map[string]*ICMPTunnelConn
+	virtualIface string // Name of virtual interface if created
+	mu           sync.RWMutex
 }
 
 // ICMPTunnelConn represents an ICMP-based tunnel connection
@@ -43,9 +46,37 @@ func (t *TCPOverICMP) Connect(ctx context.Context, serverAddr string, authToken 
 		return nil, fmt.Errorf("invalid IP address: %s", serverAddr)
 	}
 
-	// Create ICMP connection
-	conn, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
+	// If spoofing is enabled, ensure the IP exists on the system
+	if t.spoofedIP != "" {
+		exists, err := spoofing.IPExistsOnSystem(t.spoofedIP)
+		if err != nil {
+			return nil, fmt.Errorf("failed to check if IP exists: %w", err)
+		}
+		
+		if !exists {
+			// Create virtual interface for the spoofed IP
+			ifaceName, err := spoofing.CreateVirtualInterface(t.spoofedIP)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create virtual interface for %s: %w", t.spoofedIP, err)
+			}
+			t.mu.Lock()
+			t.virtualIface = ifaceName
+			t.mu.Unlock()
+		}
+	}
+
+	// Create ICMP connection - bind to spoofed IP if available
+	bindAddr := "0.0.0.0"
+	if t.spoofedIP != "" {
+		bindAddr = t.spoofedIP
+	}
+	conn, err := icmp.ListenPacket("ip4:icmp", bindAddr)
 	if err != nil {
+		// Clean up virtual interface if we created it
+		if t.virtualIface != "" {
+			spoofing.DeleteVirtualInterface(t.virtualIface)
+			t.virtualIface = ""
+		}
 		return nil, fmt.Errorf("failed to listen ICMP: %w", err)
 	}
 
@@ -80,8 +111,37 @@ func (t *TCPOverICMP) Connect(ctx context.Context, serverAddr string, authToken 
 
 // Listen starts listening for incoming ICMP connections
 func (t *TCPOverICMP) Listen(ctx context.Context, listenAddr string) (net.Listener, error) {
-	conn, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
+	// If spoofing is enabled, ensure the IP exists on the system
+	if t.spoofedIP != "" {
+		exists, err := spoofing.IPExistsOnSystem(t.spoofedIP)
+		if err != nil {
+			return nil, fmt.Errorf("failed to check if IP exists: %w", err)
+		}
+		
+		if !exists {
+			// Create virtual interface for the spoofed IP
+			ifaceName, err := spoofing.CreateVirtualInterface(t.spoofedIP)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create virtual interface for %s: %w", t.spoofedIP, err)
+			}
+			t.mu.Lock()
+			t.virtualIface = ifaceName
+			t.mu.Unlock()
+		}
+	}
+
+	// Bind to spoofed IP if available
+	bindAddr := "0.0.0.0"
+	if t.spoofedIP != "" {
+		bindAddr = t.spoofedIP
+	}
+	conn, err := icmp.ListenPacket("ip4:icmp", bindAddr)
 	if err != nil {
+		// Clean up virtual interface if we created it
+		if t.virtualIface != "" {
+			spoofing.DeleteVirtualInterface(t.virtualIface)
+			t.virtualIface = ""
+		}
 		return nil, fmt.Errorf("failed to listen ICMP: %w", err)
 	}
 
@@ -156,10 +216,27 @@ func (t *TCPOverICMP) sendEcho(dst net.IP, seq uint16, data []byte) error {
 
 // Close closes the protocol
 func (t *TCPOverICMP) Close() error {
+	var err error
 	if t.conn != nil {
-		return t.conn.Close()
+		err = t.conn.Close()
+		t.conn = nil
 	}
-	return nil
+	
+	// Clean up virtual interface if we created one
+	t.mu.Lock()
+	ifaceName := t.virtualIface
+	t.virtualIface = ""
+	t.mu.Unlock()
+	
+	if ifaceName != "" {
+		if delErr := spoofing.DeleteVirtualInterface(ifaceName); delErr != nil {
+			if err == nil {
+				err = delErr
+			}
+		}
+	}
+	
+	return err
 }
 
 // ICMPConnWrapper wraps ICMP connection to implement net.Conn

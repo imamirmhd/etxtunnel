@@ -4,18 +4,22 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"math/rand"
 	"net"
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/etxtunnel/etxtunnel/spoofing"
 )
 
 // TCPOverIP implements TCP tunneling over raw IP
 type TCPOverIP struct {
-	fd          int
-	spoofedIP   string
-	connections map[string]*IPTunnelConn
-	mu          sync.RWMutex
+	fd           int
+	spoofedIP    string
+	connections  map[string]*IPTunnelConn
+	virtualIface string // Name of virtual interface if created
+	mu           sync.RWMutex
 }
 
 // IPTunnelConn represents an IP-based tunnel connection
@@ -25,6 +29,7 @@ type IPTunnelConn struct {
 	lastActivity time.Time
 	seqNum       uint32
 	ackNum       uint32
+	srcPort      int // Source port for this connection
 }
 
 // NewTCPOverIP creates a new TCP over IP protocol handler
@@ -42,9 +47,33 @@ func (t *TCPOverIP) Connect(ctx context.Context, serverAddr string, authToken st
 		return nil, fmt.Errorf("invalid IP address: %s", serverAddr)
 	}
 
+	// If spoofing is enabled, ensure the IP exists on the system
+	if t.spoofedIP != "" {
+		exists, err := spoofing.IPExistsOnSystem(t.spoofedIP)
+		if err != nil {
+			return nil, fmt.Errorf("failed to check if IP exists: %w", err)
+		}
+		
+		if !exists {
+			// Create virtual interface for the spoofed IP
+			ifaceName, err := spoofing.CreateVirtualInterface(t.spoofedIP)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create virtual interface for %s: %w", t.spoofedIP, err)
+			}
+			t.mu.Lock()
+			t.virtualIface = ifaceName
+			t.mu.Unlock()
+		}
+	}
+
 	// Create raw socket
 	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_TCP)
 	if err != nil {
+		// Clean up virtual interface if we created it
+		if t.virtualIface != "" {
+			spoofing.DeleteVirtualInterface(t.virtualIface)
+			t.virtualIface = ""
+		}
 		return nil, fmt.Errorf("failed to create raw socket: %w", err)
 	}
 
@@ -56,6 +85,9 @@ func (t *TCPOverIP) Connect(ctx context.Context, serverAddr string, authToken st
 
 	t.fd = fd
 
+	// Generate a random ephemeral source port (49152-65535)
+	srcPort := 49152 + rand.Intn(65535-49152+1)
+	
 	// Create tunnel connection
 	tunnelConn := &IPTunnelConn{
 		id:           fmt.Sprintf("%s-%d", ip.String(), time.Now().UnixNano()),
@@ -63,6 +95,7 @@ func (t *TCPOverIP) Connect(ctx context.Context, serverAddr string, authToken st
 		lastActivity: time.Now(),
 		seqNum:       1,
 		ackNum:       0,
+		srcPort:      srcPort,
 	}
 
 	t.mu.Lock()
@@ -71,7 +104,7 @@ func (t *TCPOverIP) Connect(ctx context.Context, serverAddr string, authToken st
 
 	// Send authentication
 	authData := []byte(authToken)
-	if err := t.sendPacket(ip, tunnelConn.seqNum, tunnelConn.ackNum, authData); err != nil {
+	if err := t.sendPacket(ip, tunnelConn.seqNum, tunnelConn.ackNum, authData, tunnelConn.srcPort); err != nil {
 		syscall.Close(fd)
 		return nil, fmt.Errorf("failed to send auth: %w", err)
 	}
@@ -86,9 +119,33 @@ func (t *TCPOverIP) Connect(ctx context.Context, serverAddr string, authToken st
 
 // Listen starts listening for incoming IP connections
 func (t *TCPOverIP) Listen(ctx context.Context, listenAddr string) (net.Listener, error) {
+	// If spoofing is enabled, ensure the IP exists on the system
+	if t.spoofedIP != "" {
+		exists, err := spoofing.IPExistsOnSystem(t.spoofedIP)
+		if err != nil {
+			return nil, fmt.Errorf("failed to check if IP exists: %w", err)
+		}
+		
+		if !exists {
+			// Create virtual interface for the spoofed IP
+			ifaceName, err := spoofing.CreateVirtualInterface(t.spoofedIP)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create virtual interface for %s: %w", t.spoofedIP, err)
+			}
+			t.mu.Lock()
+			t.virtualIface = ifaceName
+			t.mu.Unlock()
+		}
+	}
+
 	// Create raw socket
 	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_TCP)
 	if err != nil {
+		// Clean up virtual interface if we created it
+		if t.virtualIface != "" {
+			spoofing.DeleteVirtualInterface(t.virtualIface)
+			t.virtualIface = ""
+		}
 		return nil, fmt.Errorf("failed to create raw socket: %w", err)
 	}
 
@@ -115,7 +172,7 @@ func (t *TCPOverIP) SendData(conn net.Conn, data []byte) error {
 	}
 
 	return t.sendPacket(ipConn.remoteIP, ipConn.tunnelConn.seqNum, 
-		ipConn.tunnelConn.ackNum, data)
+		ipConn.tunnelConn.ackNum, data, ipConn.tunnelConn.srcPort)
 }
 
 // ReceiveData receives data from the IP tunnel
@@ -153,7 +210,7 @@ func (t *TCPOverIP) ReceiveData(conn net.Conn) ([]byte, error) {
 }
 
 // sendPacket sends a raw IP packet with TCP data
-func (t *TCPOverIP) sendPacket(dst net.IP, seq, ack uint32, data []byte) error {
+func (t *TCPOverIP) sendPacket(dst net.IP, seq, ack uint32, data []byte, srcPort int) error {
 	// This is a simplified implementation
 	// Full implementation would construct proper IP and TCP headers
 	packet := make([]byte, 20+20+len(data)) // IP header + TCP header + data
@@ -177,10 +234,14 @@ func (t *TCPOverIP) sendPacket(dst net.IP, seq, ack uint32, data []byte) error {
 	copy(packet[16:20], dst.To4())
 
 	// TCP header (simplified)
-	packet[20] = 0x00 // Source port (high)
-	packet[21] = 0x00 // Source port (low)
-	packet[22] = 0x00 // Dest port (high)
-	packet[23] = 0x00 // Dest port (low)
+	// Use provided source port, or random ephemeral port if 0
+	if srcPort == 0 {
+		srcPort = 49152 + rand.Intn(65535-49152+1)
+	}
+	packet[20] = byte(srcPort >> 8)  // Source port (high)
+	packet[21] = byte(srcPort & 0xff) // Source port (low)
+	packet[22] = 0x00                 // Dest port (high) - will be set based on connection
+	packet[23] = 0x00                 // Dest port (low) - will be set based on connection
 	binary.BigEndian.PutUint32(packet[24:28], seq)
 	binary.BigEndian.PutUint32(packet[28:32], ack)
 	packet[32] = 0x50 // Data offset
@@ -205,10 +266,27 @@ func (t *TCPOverIP) sendPacket(dst net.IP, seq, ack uint32, data []byte) error {
 
 // Close closes the protocol
 func (t *TCPOverIP) Close() error {
+	var err error
 	if t.fd != 0 {
-		return syscall.Close(t.fd)
+		err = syscall.Close(t.fd)
+		t.fd = 0
 	}
-	return nil
+	
+	// Clean up virtual interface if we created one
+	t.mu.Lock()
+	ifaceName := t.virtualIface
+	t.virtualIface = ""
+	t.mu.Unlock()
+	
+	if ifaceName != "" {
+		if delErr := spoofing.DeleteVirtualInterface(ifaceName); delErr != nil {
+			if err == nil {
+				err = delErr
+			}
+		}
+	}
+	
+	return err
 }
 
 // IPConnWrapper wraps raw IP socket to implement net.Conn
@@ -284,11 +362,15 @@ func (l *IPListener) Accept() (net.Conn, error) {
 	srcIP := net.IP(buffer[12:16])
 	_ = net.IP(buffer[16:20]) // dstIP
 
+	// Generate a random ephemeral source port (49152-65535)
+	srcPort := 49152 + rand.Intn(65535-49152+1)
+	
 	// Create tunnel connection
 	tunnelConn := &IPTunnelConn{
 		id:           fmt.Sprintf("%s-%d", srcIP.String(), time.Now().UnixNano()),
 		remoteIP:     srcIP,
 		lastActivity: time.Now(),
+		srcPort:      srcPort,
 	}
 
 	l.protocol.mu.Lock()

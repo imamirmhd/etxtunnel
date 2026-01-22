@@ -38,6 +38,7 @@ type ServerConnection struct {
 	CreatedAt       time.Time
 	ClientIP        string
 	ClientInfo      *config.ClientInfo
+	pendingData     []byte // Data read during auth that needs to be forwarded
 	mu              sync.Mutex
 }
 
@@ -195,6 +196,14 @@ func (s *Server) handleConnection(clientConn net.Conn) {
 	receivedToken = receivedToken[:tokenEnd]
 	receivedToken = trimToken(receivedToken) // Remove any trailing whitespace/newlines
 	
+	// Store any remaining data after the token (e.g., HTTP request data)
+	// This data needs to be forwarded to the web server
+	var pendingData []byte
+	if tokenEnd < n {
+		pendingData = authBuffer[tokenEnd:n]
+		s.logger.Debug("Found %d bytes of data after auth token", len(pendingData))
+	}
+	
 	s.logger.Debug("Received auth token (length: %d): %q", len(receivedToken), receivedToken)
 
 	// Look up client by auth token
@@ -258,6 +267,7 @@ func (s *Server) handleConnection(clientConn net.Conn) {
 		CreatedAt:   time.Now(),
 		ClientIP:    clientIP,
 		ClientInfo:  clientInfo,
+		pendingData: pendingData, // Store data that was read during auth
 	}
 
 	s.mu.Lock()
@@ -295,7 +305,29 @@ func (s *Server) forwardConnection(conn *ServerConnection) {
 
 	// Forward from client to forward destination
 	go func() {
-		written, err := io.Copy(conn.ForwardConn, conn.ClientConn)
+		var written int64
+		var err error
+		
+		// First, send any pending data that was read during authentication
+		if len(conn.pendingData) > 0 {
+			n, writeErr := conn.ForwardConn.Write(conn.pendingData)
+			written += int64(n)
+			if writeErr != nil {
+				err = writeErr
+			} else {
+				s.logger.Debug("Forwarded %d bytes of pending data to web server", n)
+			}
+			// Clear pending data after sending
+			conn.pendingData = nil
+		}
+		
+		// Then continue forwarding remaining data from client
+		if err == nil {
+			var additionalWritten int64
+			additionalWritten, err = io.Copy(conn.ForwardConn, conn.ClientConn)
+			written += additionalWritten
+		}
+		
 		conn.mu.Lock()
 		conn.BytesSent = written
 		conn.mu.Unlock()

@@ -14,14 +14,15 @@ import (
 
 // TCPOverUDP implements TCP tunneling over UDP
 type TCPOverUDP struct {
-	conn         *net.UDPConn
-	spoofedIP    string
-	spoofedPort  int
-	connections  map[string]*UDPTunnelConn // By connection ID
-	addrConnMap  map[string]*UDPConnWrapper // By client address for connection reuse
-	mu           sync.RWMutex
-	readTimeout  time.Duration
-	writeTimeout time.Duration
+	conn            *net.UDPConn
+	spoofedIP       string
+	spoofedPort     int
+	connections     map[string]*UDPTunnelConn // By connection ID
+	addrConnMap     map[string]*UDPConnWrapper // By client address for connection reuse
+	virtualIface    string                     // Name of virtual interface if created
+	mu              sync.RWMutex
+	readTimeout     time.Duration
+	writeTimeout    time.Duration
 }
 
 // UDPTunnelConn represents a UDP-based tunnel connection
@@ -54,39 +55,69 @@ func (t *TCPOverUDP) Connect(ctx context.Context, serverAddr string, authToken s
 		return nil, fmt.Errorf("failed to resolve address: %w", err)
 	}
 
+	// If spoofing is enabled, ensure the IP exists on the system
+	if t.spoofedIP != "" {
+		exists, err := spoofing.IPExistsOnSystem(t.spoofedIP)
+		if err != nil {
+			return nil, fmt.Errorf("failed to check if IP exists: %w", err)
+		}
+		
+		if !exists {
+			// Create virtual interface for the spoofed IP
+			ifaceName, err := spoofing.CreateVirtualInterface(t.spoofedIP)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create virtual interface for %s: %w", t.spoofedIP, err)
+			}
+			t.mu.Lock()
+			t.virtualIface = ifaceName
+			t.mu.Unlock()
+		}
+	}
+
 	// Create UDP connection
+	// Bind to the spoofed IP if it exists (now it should exist after creating virtual interface)
 	var localAddr *net.UDPAddr
 	actualPort := t.spoofedPort
 	
 	if t.spoofedIP != "" {
-		// If spoofing, bind to a specific local address
+		// Bind to the spoofed IP address
 		localIP := net.ParseIP(t.spoofedIP)
-		if localIP != nil {
-			// If port is 0, use a random port from ephemeral range (49152-65535)
-			if actualPort == 0 {
-				// Ephemeral port range: 49152-65535 (IANA recommended)
-				actualPort = 49152 + rand.Intn(65535-49152+1)
-			}
-			localAddr = &net.UDPAddr{IP: localIP, Port: actualPort}
+		if localIP == nil {
+			return nil, fmt.Errorf("invalid spoofed IP address: %s", t.spoofedIP)
 		}
-	} else if actualPort == 0 {
-		// Even without spoofing, use random port if not specified
-		actualPort = 49152 + rand.Intn(65535-49152+1)
+		// If port is 0, use a random port from ephemeral range (49152-65535)
+		if actualPort == 0 {
+			actualPort = 49152 + rand.Intn(65535-49152+1)
+		}
+		localAddr = &net.UDPAddr{IP: localIP, Port: actualPort}
+	} else if actualPort != 0 {
+		// Only bind to specific port if not spoofing and port is specified
 		localAddr = &net.UDPAddr{IP: nil, Port: actualPort}
+	} else {
+		// Let system choose port
+		localAddr = nil
 	}
 	
 	conn, err := net.DialUDP("udp", localAddr, addr)
 	if err != nil {
+		// Clean up virtual interface if we created it
+		if t.virtualIface != "" {
+			spoofing.DeleteVirtualInterface(t.virtualIface)
+			t.virtualIface = ""
+		}
 		return nil, fmt.Errorf("failed to dial UDP: %w", err)
 	}
 
 	// Get the actual local port assigned (in case system assigned different port)
 	localUDPAddr := conn.LocalAddr().(*net.UDPAddr)
-	if localUDPAddr.Port != 0 {
+	if localUDPAddr != nil && localUDPAddr.Port != 0 {
 		actualPort = localUDPAddr.Port
+	} else if actualPort == 0 {
+		// If still 0, generate a random ephemeral port
+		actualPort = 49152 + rand.Intn(65535-49152+1)
 	}
 	
-	// Update spoofedPort
+	// Update spoofedPort to remember the actual port used
 	t.spoofedPort = actualPort
 
 	// Send authentication
@@ -110,14 +141,35 @@ func (t *TCPOverUDP) Connect(ctx context.Context, serverAddr string, authToken s
 	t.mu.Unlock()
 
 	return &UDPConnWrapper{
-		conn:       conn,
-		tunnelConn: tunnelConn,
-		protocol:   t,
+		conn:         conn,
+		listenConn:   nil, // Client side doesn't have a listening connection
+		tunnelConn:   tunnelConn,
+		protocol:     t,
+		isServerSide: false, // This is a client-side connection
 	}, nil
 }
 
 // Listen starts listening for incoming UDP connections
 func (t *TCPOverUDP) Listen(ctx context.Context, listenAddr string) (net.Listener, error) {
+	// If spoofing is enabled, ensure the IP exists on the system
+	if t.spoofedIP != "" {
+		exists, err := spoofing.IPExistsOnSystem(t.spoofedIP)
+		if err != nil {
+			return nil, fmt.Errorf("failed to check if IP exists: %w", err)
+		}
+		
+		if !exists {
+			// Create virtual interface for the spoofed IP
+			ifaceName, err := spoofing.CreateVirtualInterface(t.spoofedIP)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create virtual interface for %s: %w", t.spoofedIP, err)
+			}
+			t.mu.Lock()
+			t.virtualIface = ifaceName
+			t.mu.Unlock()
+		}
+	}
+
 	addr, err := net.ResolveUDPAddr("udp", listenAddr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve address: %w", err)
@@ -125,6 +177,11 @@ func (t *TCPOverUDP) Listen(ctx context.Context, listenAddr string) (net.Listene
 
 	conn, err := net.ListenUDP("udp", addr)
 	if err != nil {
+		// Clean up virtual interface if we created it
+		if t.virtualIface != "" {
+			spoofing.DeleteVirtualInterface(t.virtualIface)
+			t.virtualIface = ""
+		}
 		return nil, fmt.Errorf("failed to listen UDP: %w", err)
 	}
 
@@ -144,7 +201,14 @@ func (t *TCPOverUDP) SendData(conn net.Conn, data []byte) error {
 		return fmt.Errorf("invalid connection type")
 	}
 
-	return t.sendPacket(udpConn.conn, udpConn.tunnelConn.remoteAddr, 
+	// For server side, use listening connection to maintain correct source port
+	// For client side, use the dialed connection
+	connToUse := udpConn.conn
+	if udpConn.isServerSide && udpConn.listenConn != nil {
+		connToUse = udpConn.listenConn
+	}
+
+	return t.sendPacket(connToUse, udpConn.tunnelConn.remoteAddr, 
 		udpConn.tunnelConn.seqNum, udpConn.tunnelConn.ackNum, data)
 }
 
@@ -155,8 +219,15 @@ func (t *TCPOverUDP) ReceiveData(conn net.Conn) ([]byte, error) {
 		return nil, fmt.Errorf("invalid connection type")
 	}
 
+	// For server side, read from listening connection
+	// For client side, read from dialed connection
+	connToRead := udpConn.conn
+	if udpConn.isServerSide && udpConn.listenConn != nil {
+		connToRead = udpConn.listenConn
+	}
+
 	buffer := make([]byte, 65507) // Max UDP packet size
-	n, addr, err := udpConn.conn.ReadFromUDP(buffer)
+	n, addr, err := connToRead.ReadFromUDP(buffer)
 	if err != nil {
 		return nil, err
 	}
@@ -194,16 +265,19 @@ func (t *TCPOverUDP) sendPacket(conn *net.UDPConn, addr *net.UDPAddr, seq, ack u
 	if t.spoofedIP != "" {
 		spoofedAddr := net.ParseIP(t.spoofedIP)
 		if spoofedAddr != nil {
-			// Get actual source port from connection or use configured port
-			srcPort := t.spoofedPort
+			// Get actual source port from connection
+			srcPort := 0
+			localAddr := conn.LocalAddr()
+			if udpAddr, ok := localAddr.(*net.UDPAddr); ok && udpAddr != nil {
+				srcPort = udpAddr.Port
+			}
+			// If port is 0 or not available, use stored spoofedPort or random ephemeral port
 			if srcPort == 0 {
-				localAddr := conn.LocalAddr()
-				if udpAddr, ok := localAddr.(*net.UDPAddr); ok {
-					srcPort = udpAddr.Port
-				}
-				// If still 0, use random ephemeral port
+				srcPort = t.spoofedPort
 				if srcPort == 0 {
+					// Generate random ephemeral port and remember it
 					srcPort = 49152 + rand.Intn(65535-49152+1)
+					t.spoofedPort = srcPort
 				}
 			}
 			// Use spoofing for sending (requires root)
@@ -219,20 +293,38 @@ func (t *TCPOverUDP) sendPacket(conn *net.UDPConn, addr *net.UDPAddr, seq, ack u
 
 // Close closes the protocol
 func (t *TCPOverUDP) Close() error {
+	var err error
 	if t.conn != nil {
-		return t.conn.Close()
+		err = t.conn.Close()
 	}
-	return nil
+	
+	// Clean up virtual interface if we created one
+	t.mu.Lock()
+	ifaceName := t.virtualIface
+	t.virtualIface = ""
+	t.mu.Unlock()
+	
+	if ifaceName != "" {
+		if delErr := spoofing.DeleteVirtualInterface(ifaceName); delErr != nil {
+			if err == nil {
+				err = delErr
+			}
+		}
+	}
+	
+	return err
 }
 
 // UDPConnWrapper wraps UDP connection to implement net.Conn
 type UDPConnWrapper struct {
-	conn       *net.UDPConn
-	tunnelConn *UDPTunnelConn
-	protocol   *TCPOverUDP
-	buffer     []byte // Buffer for initial packet data
-	bufferPos  int    // Current position in buffer
-	mu         sync.Mutex
+	conn         *net.UDPConn
+	listenConn   *net.UDPConn // Listening connection (for server side)
+	tunnelConn   *UDPTunnelConn
+	protocol     *TCPOverUDP
+	buffer       []byte // Buffer for initial packet data
+	bufferPos    int    // Current position in buffer
+	isServerSide bool   // True if this is a server-side connection
+	mu           sync.Mutex
 }
 
 func (u *UDPConnWrapper) Read(b []byte) (int, error) {
@@ -354,18 +446,22 @@ func (l *UDPListener) Accept() (net.Conn, error) {
 		lastActivity: time.Now(),
 	}
 
-	// Create connection wrapper with the received data buffered
+	// For server side, we'll use the listening connection to send responses
+	// This ensures the source port matches the listening port
+	// We still create a dialed connection for client compatibility, but won't use it for sending
 	conn, err := net.DialUDP("udp", nil, addr)
 	if err != nil {
 		return nil, err
 	}
 
 	wrapper := &UDPConnWrapper{
-		conn:       conn,
-		tunnelConn: tunnelConn,
-		protocol:   l.protocol,
-		buffer:     packetData, // Store initial packet data
-		bufferPos:  0,
+		conn:         conn,
+		listenConn:   l.conn, // Store reference to listening connection
+		tunnelConn:   tunnelConn,
+		protocol:     l.protocol,
+		buffer:       packetData, // Store initial packet data
+		bufferPos:    0,
+		isServerSide: true, // This is a server-side connection
 	}
 
 	// Store in connection maps

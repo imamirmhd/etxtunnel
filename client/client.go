@@ -189,6 +189,9 @@ func (c *Client) handleConnection(localConn net.Conn) {
 	c.logger.RemoveConnection(connID)
 	localConn.Close()
 	remoteConn.Close()
+	
+	// Close protocol to clean up virtual interfaces
+	protocol.Close()
 }
 
 // forwardConnection forwards data between local and remote connections
@@ -268,11 +271,13 @@ func (c *Client) Stop() error {
 		}
 	}
 
-	// Close all connections
+	// Close all connections and protocols
 	c.mu.Lock()
 	for _, conn := range c.connections {
 		conn.LocalConn.Close()
 		conn.RemoteConn.Close()
+		// Close protocol to clean up virtual interfaces
+		conn.Protocol.Close()
 	}
 	c.mu.Unlock()
 

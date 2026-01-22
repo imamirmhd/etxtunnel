@@ -6,13 +6,16 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	"github.com/etxtunnel/etxtunnel/spoofing"
 )
 
 // TCPOverTCP implements TCP tunneling over TCP
 type TCPOverTCP struct {
-	spoofedIP   string
-	connections map[string]*TCPTunnelConn
-	mu          sync.RWMutex
+	spoofedIP    string
+	connections  map[string]*TCPTunnelConn
+	virtualIface string // Name of virtual interface if created
+	mu           sync.RWMutex
 }
 
 // TCPTunnelConn represents a TCP-based tunnel connection
@@ -32,14 +35,44 @@ func NewTCPOverTCP(spoofedIP string) *TCPOverTCP {
 
 // Connect establishes a connection to the server
 func (t *TCPOverTCP) Connect(ctx context.Context, serverAddr string, authToken string) (net.Conn, error) {
+	// If spoofing is enabled, ensure the IP exists on the system
+	if t.spoofedIP != "" {
+		exists, err := spoofing.IPExistsOnSystem(t.spoofedIP)
+		if err != nil {
+			return nil, fmt.Errorf("failed to check if IP exists: %w", err)
+		}
+		
+		if !exists {
+			// Create virtual interface for the spoofed IP
+			ifaceName, err := spoofing.CreateVirtualInterface(t.spoofedIP)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create virtual interface for %s: %w", t.spoofedIP, err)
+			}
+			t.mu.Lock()
+			t.virtualIface = ifaceName
+			t.mu.Unlock()
+		}
+	}
+
 	dialer := &net.Dialer{
 		Timeout: 30 * time.Second,
 	}
 
-	// If spoofing is configured, we'd need to use raw sockets
-	// For now, use standard TCP connection
+	// Bind to spoofed IP if available
+	if t.spoofedIP != "" {
+		localIP := net.ParseIP(t.spoofedIP)
+		if localIP != nil {
+			dialer.LocalAddr = &net.TCPAddr{IP: localIP, Port: 0}
+		}
+	}
+
 	conn, err := dialer.DialContext(ctx, "tcp", serverAddr)
 	if err != nil {
+		// Clean up virtual interface if we created it
+		if t.virtualIface != "" {
+			spoofing.DeleteVirtualInterface(t.virtualIface)
+			t.virtualIface = ""
+		}
 		return nil, fmt.Errorf("failed to dial TCP: %w", err)
 	}
 
@@ -65,8 +98,42 @@ func (t *TCPOverTCP) Connect(ctx context.Context, serverAddr string, authToken s
 
 // Listen starts listening for incoming TCP connections
 func (t *TCPOverTCP) Listen(ctx context.Context, listenAddr string) (net.Listener, error) {
-	listener, err := net.Listen("tcp", listenAddr)
+	// If spoofing is enabled, ensure the IP exists on the system
+	if t.spoofedIP != "" {
+		exists, err := spoofing.IPExistsOnSystem(t.spoofedIP)
+		if err != nil {
+			return nil, fmt.Errorf("failed to check if IP exists: %w", err)
+		}
+		
+		if !exists {
+			// Create virtual interface for the spoofed IP
+			ifaceName, err := spoofing.CreateVirtualInterface(t.spoofedIP)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create virtual interface for %s: %w", t.spoofedIP, err)
+			}
+			t.mu.Lock()
+			t.virtualIface = ifaceName
+			t.mu.Unlock()
+		}
+	}
+
+	// Parse listen address and replace with spoofed IP if needed
+	actualListenAddr := listenAddr
+	if t.spoofedIP != "" {
+		// Extract port from listenAddr
+		_, port, err := net.SplitHostPort(listenAddr)
+		if err == nil {
+			actualListenAddr = net.JoinHostPort(t.spoofedIP, port)
+		}
+	}
+
+	listener, err := net.Listen("tcp", actualListenAddr)
 	if err != nil {
+		// Clean up virtual interface if we created it
+		if t.virtualIface != "" {
+			spoofing.DeleteVirtualInterface(t.virtualIface)
+			t.virtualIface = ""
+		}
 		return nil, fmt.Errorf("failed to listen TCP: %w", err)
 	}
 
@@ -105,6 +172,18 @@ func (t *TCPOverTCP) Close() error {
 		}
 	}
 	t.connections = make(map[string]*TCPTunnelConn)
+
+	// Clean up virtual interface if we created one
+	ifaceName := t.virtualIface
+	t.virtualIface = ""
+	t.mu.Unlock()
+	
+	if ifaceName != "" {
+		if err := spoofing.DeleteVirtualInterface(ifaceName); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	t.mu.Lock()
 
 	if len(errs) > 0 {
 		return errs[0]
